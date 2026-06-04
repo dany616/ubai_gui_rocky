@@ -181,8 +181,15 @@ def load_original_key_config() -> dict[str, str]:
         username = ORIGINAL_USERNAME_FILE.read_text(encoding="utf-8", errors="replace").strip()
         if username:
             data["ubai_user"] = username.splitlines()[0].strip()
-    if ORIGINAL_KEY_FILE.exists():
-        data["ubai_key"] = "secrets/original_key/key.pem"
+    key_file = ORIGINAL_KEY_FILE
+    if not key_file.exists() and ORIGINAL_KEY_DIR.exists():
+        pem_files = sorted(ORIGINAL_KEY_DIR.glob("*.pem"))
+        if len(pem_files) == 1:
+            key_file = pem_files[0]
+            if "ubai_user" not in data and key_file.stem:
+                data["ubai_user"] = key_file.stem
+    if key_file.exists():
+        data["ubai_key"] = str(key_file.relative_to(REPO_ROOT)).replace("\\", "/")
     return data
 
 
@@ -854,6 +861,7 @@ mkdir -p {remote_cd_expr(REMOTE_REPO)}
 set -euo pipefail
 cd {remote_cd_expr(REMOTE_REPO)}
 mkdir -p config logs
+find config container image scripts slurm tools -type f \\( -name '*.sh' -o -name '*.sbatch' -o -name '*.py' -o -name '*.env' -o -name '*.json' -o -name 'Containerfile*' \\) -exec sed -i $'s/\\r$//' {{}} +
 if [ ! -f config/session.env ]; then
   cp config/example.env config/session.env
 fi
@@ -871,6 +879,13 @@ if grep -q '^export UBAI_IMAGE_BACKEND=' config/session.env; then
 else
   printf 'export UBAI_IMAGE_BACKEND="enroot"\\n' >> config/session.env
 fi
+tmp_env=$(mktemp)
+grep -v -E '^export (UBAI_BUILD_(ROOT|WORKDIR)|UBAI_IMAGE|UBAI_SLURM_NODELIST)=' config/session.env > "$tmp_env"
+mv "$tmp_env" config/session.env
+printf 'export UBAI_BUILD_ROOT="${{TMPDIR:-/tmp}}/${{USER:-ubai}}/ubai-runtime/enroot"\\n' >> config/session.env
+printf 'export UBAI_IMAGE="$UBAI_BUILD_ROOT/ubai-cst-rocky94-xrdp.sqsh"\\n' >> config/session.env
+printf 'export UBAI_BUILD_WORKDIR="$UBAI_BUILD_ROOT/build-ubai-cst-rocky94"\\n' >> config/session.env
+printf 'export UBAI_SLURM_NODELIST=""\\n' >> config/session.env
 chmod +x scripts/*.sh image/*.sh container/*.sh tools/*.py 2>/dev/null || true
 echo "[OK] remote project ready: $HOME/ubai_gui"
 """
@@ -1176,9 +1191,10 @@ echo "UBAI_UI_IMAGE_PATH=$UBAI_IMAGE"
 
         build_match = re.search(r"UBAI_UI_BUILD_JOB_ID=(\d+)", output)
         image_match = re.search(r"UBAI_UI_IMAGE_PATH=(.+)", output)
+        build_node = ""
         if build_match:
             image_path = image_match.group(1).strip() if image_match else ""
-            self._wait_until_image_ready(values, build_match.group(1), image_path)
+            build_node = self._wait_until_image_ready(values, build_match.group(1), image_path)
             if self.stop_requested.is_set():
                 return "꺼짐"
 
@@ -1186,6 +1202,12 @@ echo "UBAI_UI_IMAGE_PATH=$UBAI_IMAGE"
 set -euo pipefail
 cd {remote_cd_expr(REMOTE_REPO)}
 ui_env=config/ui-session.env
+if [ -n {shlex.quote(build_node)} ]; then
+  tmp_env=$(mktemp)
+  grep -v '^export UBAI_SLURM_NODELIST=' "$ui_env" > "$tmp_env"
+  mv "$tmp_env" "$ui_env"
+  printf '%s\\n' {shlex.quote(env_export("UBAI_SLURM_NODELIST", build_node))} >> "$ui_env"
+fi
 out=$(./scripts/submit_xrdp_job.sh "$ui_env" 2>&1)
 printf '%s\\n' "$out"
 job=$(printf '%s\\n' "$out" | awk '/Submitted batch job/ {{print $4; exit}}')
@@ -1213,21 +1235,25 @@ fi
             self.post_log("[WARN] job id를 찾지 못했습니다. 상태 새로고침으로 확인하세요.")
             return "대기 중"
 
-    def _wait_until_image_ready(self, values: dict[str, str], build_job_id: str, image_path: str) -> None:
+    def _wait_until_image_ready(self, values: dict[str, str], build_job_id: str, image_path: str) -> str:
         self.post_status("이미지 빌드 중")
         self.post_log(f"[INFO] enroot 이미지 자동 빌드 대기 중: job={build_job_id}")
         for _ in range(240):
             if self.stop_requested.is_set():
                 self.post_log("[INFO] 컨테이너 끄기 요청으로 이미지 빌드 대기를 중단했습니다.")
-                return
+                return ""
             script = f"""
 set +e
 cd {remote_cd_expr(REMOTE_REPO)}
 job={shlex.quote(build_job_id)}
 image={shlex.quote(image_path)}
-if [ -n "$image" ] && [ -f "$image" ]; then
+if [ -n "$image" ] && [ -f "$image" ] && ! squeue -h -j "$job" | grep -q .; then
   echo "[OK] enroot image ready: $image"
   ls -lh "$image"
+  node=$(sacct -n -X -j "$job" --format=NodeList 2>/dev/null | awk 'NF && $1 != "None" {{print $1; exit}}')
+  if [ -n "$node" ]; then
+    echo "UBAI_UI_BUILD_NODE=$node"
+  fi
   exit 0
 fi
 if squeue -h -j "$job" | grep -q .; then
@@ -1237,6 +1263,14 @@ if squeue -h -j "$job" | grep -q .; then
   echo "--- build stderr tail"
   tail -n 8 "logs/ubai-build-image-${{job}}.err" 2>/dev/null || true
   exit 10
+fi
+if [ -n "$image" ] && grep -qxF "[OK] Built image: $image" "logs/ubai-build-image-${{job}}.out" 2>/dev/null; then
+  echo "[OK] enroot image ready on build node: $image"
+  node=$(sacct -n -X -j "$job" --format=NodeList 2>/dev/null | awk 'NF && $1 != "None" {{print $1; exit}}')
+  if [ -n "$node" ]; then
+    echo "UBAI_UI_BUILD_NODE=$node"
+  fi
+  exit 0
 fi
 echo "[ERROR] image build job ended but image is missing: $image"
 sacct -j "$job" --format=JobID,JobName,State,ExitCode,Elapsed,NodeList,Reason 2>/dev/null || true
@@ -1252,7 +1286,11 @@ exit 2
                 self.post_log(output)
             if result.returncode == 0:
                 self.post_status("켜는 중")
-                return
+                node_match = re.search(r"UBAI_UI_BUILD_NODE=(\S+)", output)
+                build_node = node_match.group(1) if node_match else ""
+                if build_node:
+                    self.post_log(f"[INFO] enroot 이미지가 있는 계산노드로 XRDP job을 고정합니다: {build_node}")
+                return build_node
             if result.returncode != 10:
                 raise RuntimeError("enroot image build failed")
             threading.Event().wait(30)

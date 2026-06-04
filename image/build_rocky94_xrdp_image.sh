@@ -2,15 +2,24 @@
 set -euo pipefail
 
 : "${UBAI_BASE_IMAGE:=docker://rockylinux/rockylinux:9.4}"
-: "${UBAI_IMAGE:=$HOME/runtime/enroot/ubai-cst-rocky94-xrdp.sqsh}"
+: "${UBAI_BUILD_ROOT:=${TMPDIR:-/tmp}/${USER:-ubai}/ubai-runtime/enroot}"
+: "${UBAI_IMAGE:=$UBAI_BUILD_ROOT/ubai-cst-rocky94-xrdp.sqsh}"
 : "${UBAI_ENROOT_NAME:=ubai-cst-rocky94-xrdp-build}"
-: "${UBAI_BUILD_WORKDIR:=$HOME/runtime/enroot/build-ubai-cst-rocky94}"
+: "${UBAI_BUILD_WORKDIR:=$UBAI_BUILD_ROOT/build-ubai-cst-rocky94}"
 : "${UBAI_BUILD_INCLUDE_CST_DEPS:=0}"
 : "${UBAI_ROCKY_MIRROR:=https://ftp.kaist.ac.kr/pub/rocky/9}"
 : "${UBAI_EPEL_MIRROR:=https://ftp.kaist.ac.kr/pub/epel/9}"
+: "${ENROOT_RUNTIME_PATH:=$UBAI_BUILD_ROOT/runtime}"
+: "${ENROOT_CACHE_PATH:=$UBAI_BUILD_ROOT/cache}"
+: "${ENROOT_DATA_PATH:=$UBAI_BUILD_ROOT/data}"
+: "${ENROOT_TEMP_PATH:=$UBAI_BUILD_ROOT/tmp}"
 export UBAI_BUILD_INCLUDE_CST_DEPS
 export UBAI_ROCKY_MIRROR
 export UBAI_EPEL_MIRROR
+export ENROOT_RUNTIME_PATH
+export ENROOT_CACHE_PATH
+export ENROOT_DATA_PATH
+export ENROOT_TEMP_PATH
 
 if [ "$UBAI_BASE_IMAGE" = "docker://rockylinux:9.4" ]; then
   echo "[INFO] Rewriting legacy Rocky image reference to docker://rockylinux/rockylinux:9.4"
@@ -20,11 +29,13 @@ fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 
-mkdir -p "$(dirname "$UBAI_IMAGE")" "$UBAI_BUILD_WORKDIR"
+mkdir -p "$(dirname "$UBAI_IMAGE")" "$UBAI_BUILD_WORKDIR" \
+  "$ENROOT_RUNTIME_PATH" "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH" "$ENROOT_TEMP_PATH"
 
 echo "[INFO] Base image: $UBAI_BASE_IMAGE"
 echo "[INFO] Target image: $UBAI_IMAGE"
 echo "[INFO] Build workdir: $UBAI_BUILD_WORKDIR"
+echo "[INFO] Enroot data path: $ENROOT_DATA_PATH"
 echo "[INFO] Rocky mirror: $UBAI_ROCKY_MIRROR"
 echo "[INFO] EPEL mirror: $UBAI_EPEL_MIRROR"
 

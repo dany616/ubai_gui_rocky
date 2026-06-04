@@ -21,6 +21,7 @@ sbatch_args=()
 [ -n "${UBAI_SLURM_CPUS_PER_TASK:-}" ] && sbatch_args+=(--cpus-per-task="$UBAI_SLURM_CPUS_PER_TASK")
 [ -n "${UBAI_SLURM_MEM:-}" ] && sbatch_args+=(--mem="$UBAI_SLURM_MEM")
 [ -n "${UBAI_SLURM_GPUS:-}" ] && sbatch_args+=(--gres="gpu:${UBAI_SLURM_GPUS}")
+[ -n "${UBAI_SLURM_NODELIST:-}" ] && sbatch_args+=(--nodelist="$UBAI_SLURM_NODELIST")
 
 mkdir -p "$repo_root/logs"
 
