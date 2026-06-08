@@ -833,10 +833,14 @@ class UbaiManager(tk.Tk):
             return
         self.node_usage_tree.delete(*self.node_usage_tree.get_children())
         available_count = 0
+        idle_count = 0
         mixed_count = 0
         for row in rows:
-            if str(row.get("state", "")).upper().startswith("MIXED"):
+            state = str(row.get("state", "")).upper()
+            if state.startswith("MIXED"):
                 mixed_count += 1
+            elif state.startswith("IDLE"):
+                idle_count += 1
             tags = ()
             if row.get("is_available_mixed"):
                 available_count += 1
@@ -859,7 +863,8 @@ class UbaiManager(tk.Tk):
                 tags=tags,
             )
         self.node_usage_summary_var.set(
-            f"노드 사용률: 전체 {len(rows)}개 | mixed {mixed_count}개 | FreeMem 400GB 이상 mixed {available_count}개"
+            f"노드 사용률: 전체 {len(rows)}개 | mixed {mixed_count}개 | "
+            f"mixed+idle {mixed_count + idle_count}개 | FreeMem 400GB 이상 mixed {available_count}개"
         )
 
     def _drain_messages(self) -> None:
@@ -1643,9 +1648,10 @@ echo "__UBAI_NODE_USAGE_END__"
         self.post_node_usage(rows)
         available = [row for row in rows if row.get("is_available_mixed")]
         mixed_count = sum(1 for row in rows if str(row.get("state", "")).upper().startswith("MIXED"))
+        idle_count = sum(1 for row in rows if str(row.get("state", "")).upper().startswith("IDLE"))
         self.post_log(
             f"[OK] 노드 사용률 조회 완료: 전체 {len(rows)}개, mixed {mixed_count}개, "
-            f"FreeMem 400GB 이상 mixed {len(available)}개"
+            f"mixed+idle {mixed_count + idle_count}개, FreeMem 400GB 이상 mixed {len(available)}개"
         )
         if available:
             lines = ["--- FreeMem 400GB 이상 mixed 노드"]
