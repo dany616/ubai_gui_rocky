@@ -94,6 +94,26 @@ glxinfo | grep -E "OpenGL vendor|OpenGL renderer|OpenGL version"
 
 If renderer contains `llvmpipe`, the GUI is using CPU software rendering. That may still be usable for setup but slow for heavy 3D interaction.
 
+## Find Mixed Nodes With At Least 400 GB Free Memory
+
+The Windows GUI has a `노드 사용률 조회` button that queries Slurm through the gate node and highlights mixed nodes whose `FreeMem` is at least `409600 MB` (`400 * 1024`).
+
+Manual check on the gate node:
+
+```bash
+for n in $(sinfo -N -t mix -h -o "%N"); do
+  echo "===== $n ====="
+  scontrol show node "$n" | egrep "CPUAlloc|CPUTot|RealMemory|AllocMem|FreeMem|Gres|GresUsed"
+done
+```
+
+Relevant fields:
+
+- `CPUAlloc / CPUTot`: allocated CPU cores over total CPU cores.
+- `AllocMem / RealMemory`: Slurm allocated memory over configured node memory.
+- `FreeMem`: currently free memory in MB; `FreeMem >= 409600` means at least 400 GB is free.
+- `Gres / GresUsed`: configured and used generic resources, usually GPUs.
+
 ## CST Cannot Get License
 
 Check license server reachability from the compute node/container:

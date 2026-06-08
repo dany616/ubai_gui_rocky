@@ -122,6 +122,7 @@ PARTITION_RESOURCES: tuple[dict[str, str], ...] = (
 )
 PARTITION_RESOURCE_BY_NAME = {item["name"]: item for item in PARTITION_RESOURCES}
 DEFAULT_PARTITIONS = tuple(item["name"] for item in PARTITION_RESOURCES)
+NODE_FREE_MEM_THRESHOLD_MB = 400 * 1024
 
 DEFAULTS = {
     "ubai_user": "",
@@ -211,6 +212,96 @@ def env_export(name: str, value: str, *, allow_home: bool = False) -> str:
     if not allow_home:
         escaped = escaped.replace("$", "\\$")
     return f'export {name}="{escaped}"'
+
+
+def parse_slurm_key_values(line: str) -> dict[str, str]:
+    return {match.group(1): match.group(2) for match in re.finditer(r"(\w+)=([^\s]+)", line)}
+
+
+def safe_int(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def mb_to_gb_text(value_mb: int | None) -> str:
+    if value_mb is None:
+        return "-"
+    return f"{value_mb / 1024:.1f}"
+
+
+def node_sort_key(name: str) -> tuple[str, int, str]:
+    match = re.fullmatch(r"([A-Za-z_-]+)(\d+)", name)
+    if not match:
+        return (name, -1, "")
+    return (match.group(1), int(match.group(2)), name)
+
+
+def parse_node_usage_output(output: str) -> list[dict[str, object]]:
+    sinfo: dict[str, dict[str, str]] = {}
+    details: dict[str, dict[str, str]] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("SINFO|"):
+            parts = line.split("|", 6)
+            if len(parts) == 7:
+                _, node, state, partition, cpus, mem_mb, gres = parts
+                sinfo[node] = {
+                    "state": state,
+                    "partition": partition.rstrip("*"),
+                    "cpus": cpus,
+                    "mem_mb": mem_mb,
+                    "gres": gres,
+                }
+        elif line.startswith("NODE|"):
+            data = parse_slurm_key_values(line[5:])
+            node = data.get("NodeName", "")
+            if node:
+                details[node] = data
+
+    rows: list[dict[str, object]] = []
+    for node in sorted(sinfo, key=node_sort_key):
+        summary = sinfo[node]
+        detail = details.get(node, {})
+        state = detail.get("State", summary["state"]).split("+", 1)[0]
+        partition = detail.get("Partitions", summary["partition"]).rstrip("*")
+        cpu_alloc = safe_int(detail.get("CPUAlloc"))
+        cpu_total = safe_int(detail.get("CPUTot")) or safe_int(summary.get("cpus"))
+        real_mem = safe_int(detail.get("RealMemory")) or safe_int(summary.get("mem_mb"))
+        free_mem = safe_int(detail.get("FreeMem"))
+        gres = detail.get("Gres") or summary.get("gres") or "-"
+        gres_used = detail.get("GresUsed") or "-"
+
+        if cpu_alloc is not None and cpu_total:
+            cpu_text = f"{cpu_alloc}/{cpu_total}"
+            cpu_pct = f"{(cpu_alloc / cpu_total) * 100:.1f}%"
+        elif cpu_total:
+            cpu_text = f"-/{cpu_total}"
+            cpu_pct = "-"
+        else:
+            cpu_text = "-"
+            cpu_pct = "-"
+
+        is_available_mixed = state.upper().startswith("MIXED") and free_mem is not None and free_mem >= NODE_FREE_MEM_THRESHOLD_MB
+        rows.append(
+            {
+                "node": node,
+                "state": state,
+                "partition": partition,
+                "cpu": cpu_text,
+                "cpu_pct": cpu_pct,
+                "free_mem_gb": mb_to_gb_text(free_mem),
+                "real_mem_gb": mb_to_gb_text(real_mem),
+                "gres": gres,
+                "gres_used": gres_used,
+                "free_mem_mb": free_mem,
+                "is_available_mixed": is_available_mixed,
+            }
+        )
+    return rows
 
 
 def ssh_target(values: dict[str, str]) -> str:
@@ -330,10 +421,12 @@ class UbaiManager(tk.Tk):
         self.partition_combo: ttk.Combobox | None = None
         self.partition_tree: ttk.Treeview | None = None
         self.partition_detail_var = tk.StringVar(value="")
+        self.node_usage_tree: ttk.Treeview | None = None
+        self.node_usage_summary_var = tk.StringVar(value="노드 사용률 조회 전")
         self.syncing_partition_selection = False
         self.worker: threading.Thread | None = None
         self.stop_requested = threading.Event()
-        self.messages: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
 
         self._build_ui()
         self.after(100, self._drain_messages)
@@ -492,18 +585,20 @@ class UbaiManager(tk.Tk):
         ttk.Label(res, text="root").grid(row=1, column=7, padx=6, pady=6, sticky="w")
         self._entry(res, "Root password", "xrdp_password", 2, 0, colspan=3, show="*")
         self._build_partition_resource_table(res)
+        self._build_node_usage_table(res)
 
         actions = ttk.Frame(self)
         actions.grid(row=2, column=0, padx=12, pady=6, sticky="ew")
-        actions.columnconfigure(8, weight=1)
+        actions.columnconfigure(9, weight=1)
         ttk.Button(actions, text="컨테이너 켜기", command=self.start_vm).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(actions, text="컨테이너 끄기", command=self.stop_vm).grid(row=0, column=1, padx=6)
         ttk.Button(actions, text="접속하기", command=self.connect_rdp).grid(row=0, column=2, padx=6)
         ttk.Button(actions, text="상태 새로고침", command=self.refresh_status).grid(row=0, column=3, padx=6)
-        ttk.Label(actions, text="상태:").grid(row=0, column=4, padx=(16, 4))
-        ttk.Label(actions, textvariable=self.status_var).grid(row=0, column=5, sticky="w")
-        ttk.Label(actions, text="Job:").grid(row=0, column=6, padx=(16, 4))
-        ttk.Label(actions, textvariable=self.job_var).grid(row=0, column=7, sticky="w")
+        ttk.Button(actions, text="노드 사용률 조회", command=self.refresh_node_usage).grid(row=0, column=4, padx=6)
+        ttk.Label(actions, text="상태:").grid(row=0, column=5, padx=(16, 4))
+        ttk.Label(actions, textvariable=self.status_var).grid(row=0, column=6, sticky="w")
+        ttk.Label(actions, text="Job:").grid(row=0, column=7, padx=(16, 4))
+        ttk.Label(actions, textvariable=self.job_var).grid(row=0, column=8, sticky="w")
 
         output_frame = ttk.LabelFrame(self, text="상태 / 자원 사용량")
         output_frame.grid(row=3, column=0, padx=12, pady=(6, 12), sticky="nsew")
@@ -623,6 +718,41 @@ class UbaiManager(tk.Tk):
         )
         self._update_partition_detail()
 
+    def _build_node_usage_table(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, textvariable=self.node_usage_summary_var).grid(
+            row=5, column=0, columnspan=8, padx=6, pady=(8, 4), sticky="ew"
+        )
+        columns = ("node", "state", "partition", "cpu", "cpu_pct", "free_mem_gb", "real_mem_gb", "gres", "gres_used")
+        tree = ttk.Treeview(parent, columns=columns, show="headings", height=8)
+        headings = {
+            "node": "Node",
+            "state": "State",
+            "partition": "Partition",
+            "cpu": "CPU",
+            "cpu_pct": "CPU %",
+            "free_mem_gb": "Mem Free GB",
+            "real_mem_gb": "Mem Total GB",
+            "gres": "Gres",
+            "gres_used": "GresUsed",
+        }
+        widths = {
+            "node": 70,
+            "state": 90,
+            "partition": 80,
+            "cpu": 70,
+            "cpu_pct": 64,
+            "free_mem_gb": 98,
+            "real_mem_gb": 98,
+            "gres": 150,
+            "gres_used": 150,
+        }
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], anchor="w", stretch=True)
+        tree.tag_configure("available_mixed", foreground=NORD["frost0"])
+        tree.grid(row=6, column=0, columnspan=8, padx=6, pady=(0, 6), sticky="ew")
+        self.node_usage_tree = tree
+
     def _choose_key(self) -> None:
         path = filedialog.askopenfilename(initialdir=str(REPO_ROOT / "secrets"))
         if path:
@@ -695,6 +825,43 @@ class UbaiManager(tk.Tk):
     def post_status(self, text: str) -> None:
         self.messages.put(("status", text))
 
+    def post_node_usage(self, rows: list[dict[str, object]]) -> None:
+        self.messages.put(("node_usage", rows))
+
+    def _apply_node_usage_rows(self, rows: list[dict[str, object]]) -> None:
+        if not self.node_usage_tree:
+            return
+        self.node_usage_tree.delete(*self.node_usage_tree.get_children())
+        available_count = 0
+        mixed_count = 0
+        for row in rows:
+            if str(row.get("state", "")).upper().startswith("MIXED"):
+                mixed_count += 1
+            tags = ()
+            if row.get("is_available_mixed"):
+                available_count += 1
+                tags = ("available_mixed",)
+            self.node_usage_tree.insert(
+                "",
+                "end",
+                iid=str(row.get("node", "")),
+                values=(
+                    row.get("node", ""),
+                    row.get("state", ""),
+                    row.get("partition", ""),
+                    row.get("cpu", ""),
+                    row.get("cpu_pct", ""),
+                    row.get("free_mem_gb", ""),
+                    row.get("real_mem_gb", ""),
+                    row.get("gres", ""),
+                    row.get("gres_used", ""),
+                ),
+                tags=tags,
+            )
+        self.node_usage_summary_var.set(
+            f"노드 사용률: 전체 {len(rows)}개 | mixed {mixed_count}개 | FreeMem 400GB 이상 mixed {available_count}개"
+        )
+
     def _drain_messages(self) -> None:
         while True:
             try:
@@ -702,12 +869,14 @@ class UbaiManager(tk.Tk):
             except queue.Empty:
                 break
             if kind == "log":
-                self.log(text)
+                self.log(str(text))
             elif kind == "status":
-                self.operation_state = text
+                self.operation_state = str(text)
                 self._set_connection_text()
             elif kind == "job":
-                self.job_var.set(text)
+                self.job_var.set(str(text))
+            elif kind == "node_usage":
+                self._apply_node_usage_rows(text if isinstance(text, list) else [])
         self.after(100, self._drain_messages)
 
     def _tick_connection_indicator(self) -> None:
@@ -1445,6 +1614,50 @@ Get-CimInstance Win32_Process |
 
     def refresh_status(self) -> None:
         self.run_task("상태 확인 중", self._refresh_status)
+
+    def refresh_node_usage(self) -> None:
+        self.run_task("노드 사용률 조회 중", self._refresh_node_usage)
+
+    def _refresh_node_usage(self) -> str:
+        values = self.values()
+        script = """
+set +e
+echo "__UBAI_NODE_USAGE_BEGIN__"
+sinfo -N -h -o "SINFO|%N|%t|%P|%c|%m|%G"
+scontrol show node -o | sed 's/^/NODE|/'
+echo "__UBAI_NODE_USAGE_END__"
+"""
+        result = self.run_remote(values, script, timeout=90)
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            self.post_log(output.rstrip() or f"[WARN] node usage command rc={result.returncode}")
+            return "대기 중"
+
+        rows = parse_node_usage_output(output)
+        if not rows:
+            self.post_log("[WARN] 노드 사용률 정보를 파싱하지 못했습니다.")
+            if output.strip():
+                self.post_log(output.rstrip())
+            return "대기 중"
+
+        self.post_node_usage(rows)
+        available = [row for row in rows if row.get("is_available_mixed")]
+        mixed_count = sum(1 for row in rows if str(row.get("state", "")).upper().startswith("MIXED"))
+        self.post_log(
+            f"[OK] 노드 사용률 조회 완료: 전체 {len(rows)}개, mixed {mixed_count}개, "
+            f"FreeMem 400GB 이상 mixed {len(available)}개"
+        )
+        if available:
+            lines = ["--- FreeMem 400GB 이상 mixed 노드"]
+            for row in available:
+                lines.append(
+                    f"{row['node']} | FreeMem {row['free_mem_gb']}GB | CPU {row['cpu']} | "
+                    f"Gres {row['gres']} | GresUsed {row['gres_used']}"
+                )
+            self.post_log("\n".join(lines))
+        else:
+            self.post_log("[INFO] FreeMem 400GB 이상인 mixed 노드가 없습니다.")
+        return "대기 중"
 
     def _refresh_status(self) -> None:
         values = self.values()
